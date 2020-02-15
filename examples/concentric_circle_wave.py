@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 sys.path.append("../src")
 from util_functions import mean_squared_error, mean_absolute_error
 from kalman import KalmanFilter
+from llock import LocalLOCK
 from lslock import LSLOCK
 
 
@@ -79,7 +80,8 @@ def main():
     d = 1 # number of adjacency element
     advance = True
     sigma_initial = 0 # standard deviation of normal distribution for random making
-    update_interval = 5 # update interval
+    update_interval = 10 # update interval for LSLOCK
+    llock_update_interval = 30 # update interval for LLOCK
     eta = 0.99 # learning rate
     cutoff = 1.0 # cutoff distance for update of transition matrix
     sigma = 0.2  # standard deviation of gaussian noise
@@ -88,9 +90,9 @@ def main():
 
 
     ## record list
-    mse_record = xp.zeros((2, 3, Tf))
-    mae_record = xp.zeros((2, 3, Tf))
-    time_record = xp.zeros(3)
+    mse_record = xp.zeros((2, 4, Tf))
+    mae_record = xp.zeros((2, 4, Tf))
+    time_record = xp.zeros((2, 3))
 
     all_start_time = time.time()
 
@@ -106,11 +108,38 @@ def main():
     for t in range(Tf):
         filtered_value[t] = kf.forward_update(t, obs[t], return_on=True)
     xp.save(os.path.join(save_root, "kf_states.npy"), filtered_value)
+
+    ## LLOCK
+    llock_save_dir = os.path.join(save_root, "llock")
+    if not os.path.exists(llock_save_dir):
+        os.mkdir(llock_save_dir)
+
+    print("LLOCK : d={}, update_interval={}, eta={}, cutoff={}".format(
+        d, llock_update_interval, eta, cutoff))
+    llock = LocalLOCK(observation = obs, 
+                     transition_matrix = F_initial,
+                     transition_covariance = Q, 
+                     observation_covariance = R,
+                     initial_mean = obs[0], 
+                     adjacency_matrix = A,
+                     dtype = dtype,
+                     update_interval = llock_update_interval,
+                     eta = eta, 
+                     cutoff = cutoff,
+                     save_dir = llock_save_dir,
+                     advance_mode = advance,
+                     use_gpu = False)
+    start_time = time.time()
+    llock.forward()
+    time_record[0,0] = time.time() - start_time
+    time_record[0,1] = llock.times[3]
+    time_record[0,2] = llock.times[3] / llock.times[4]
+    print("LLOCK times : {}".format(time.time() - start_time))
                             
     ## LSLOCK
-    save_dir = os.path.join(save_root, "lslock")
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
+    lslock_save_dir = os.path.join(save_root, "lslock")
+    if not os.path.exists(lslock_save_dir):
+        os.mkdir(lslock_save_dir)
 
     print("LSLOCK : d={}, update_interval={}, eta={}, cutoff={}".format(
         d, update_interval, eta, cutoff))
@@ -124,15 +153,15 @@ def main():
                  update_interval = update_interval,
                  eta = eta, 
                  cutoff = cutoff,
-                 save_dir = save_dir,
+                 save_dir = lslock_save_dir,
                  advance_mode = advance,
                  method = "gridwise",
                  use_gpu = False)
     start_time = time.time()
     lslock.forward()
-    time_record[0] = time.time() - start_time
-    time_record[1] = lslock.times[3]
-    time_record[2] = lslock.times[3] / lslock.times[4]
+    time_record[1,0] = time.time() - start_time
+    time_record[1,1] = lslock.times[3]
+    time_record[1,2] = lslock.times[3] / lslock.times[4]
     print("LSLOCK times : {}".format(time.time() - start_time))
 
     # record error infromation
@@ -146,15 +175,21 @@ def main():
                                     lslock.get_filtered_value()[t][area],
                                     true_xp[t][area])
             mse_record[r,1,t] = mean_squared_error(
-                                    filtered_value[t][area],
+                                    llock.get_filtered_value()[t][area],
                                     true_xp[t][area])
             mae_record[r,1,t] = mean_absolute_error(
-                                    filtered_value[t][area],
+                                    llock.get_filtered_value()[t][area],
                                     true_xp[t][area])
             mse_record[r,2,t] = mean_squared_error(
-                                    obs[t][area],
+                                    filtered_value[t][area],
                                     true_xp[t][area])
             mae_record[r,2,t] = mean_absolute_error(
+                                    filtered_value[t][area],
+                                    true_xp[t][area])
+            mse_record[r,3,t] = mean_squared_error(
+                                    obs[t][area],
+                                    true_xp[t][area])
+            mae_record[r,3,t] = mean_absolute_error(
                                     obs[t][area],
                                     true_xp[t][area])
 
@@ -167,7 +202,7 @@ def main():
     # mse_record = np.load(os.path.join(save_root, "mse_record.npy"))
 
     fig, ax = plt.subplots(1,1,figsize=(8,5))
-    for i, label in enumerate(["LSLOCK", "KF", "observation"]):
+    for i, label in enumerate(["LSLOCK", "LLOCK", "KF", "observation"]):
         ax.plot(mse_record[1,i], label=label, lw=2)
     ax.set_xlabel("Timestep", fontsize=12)
     ax.set_ylabel("MSE", fontsize=12)
@@ -177,31 +212,42 @@ def main():
 
 
     ## short-term prediction
-    color_list = ["r", "g", "b"]
-    threshold = 400
+    color_list = ["r", "g", "b", "m"]
+    threshold = 200
     pred_state = xp.zeros((Tf, Nf*Nf))
+    llock_pred_state = xp.zeros((Tf, Nf*Nf))
     pred_mse = mse_record[0].copy()
 
     s = threshold//update_interval
-    F = np.load(os.path.join(save_dir, "transition_matrix_{:03}.npy".format(s)))
-    state = np.load(os.path.join(save_dir, "states.npy"))[threshold]
+    F = np.load(os.path.join(lslock_save_dir, "transition_matrix_{:03}.npy".format(s)))
+    state = np.load(os.path.join(lslock_save_dir, "states.npy"))[threshold]
     pred_state[threshold] = state.reshape(-1)
     for t in range(threshold, Tf-1):
         pred_state[t+1] = F @ pred_state[t]
 
+    s = threshold//llock_update_interval
+    F = np.load(os.path.join(llock_save_dir, "transition_matrix_{:02}.npy".format(s)))
+    llock_state = np.load(os.path.join(llock_save_dir, "states.npy"))[threshold]
+    llock_pred_state[threshold] = llock_state.reshape(-1)
+    for t in range(threshold, Tf-1):
+        llock_pred_state[t+1] = F @ llock_pred_state[t]
+
     kf_state = np.load(os.path.join(save_root, "kf_states.npy"))[threshold]
     for t in range(threshold, Tf):
         pred_mse[0,t] = mean_squared_error(pred_state[t], true_xp[t])
-        pred_mse[1,t] = mean_squared_error(kf_state.reshape(-1), true_xp[t])
-        pred_mse[2,t] = mean_squared_error(obs[threshold], true_xp[t])
+        pred_mse[1,t] = mean_squared_error(llock_pred_state[t], true_xp[t])
+        pred_mse[2,t] = mean_squared_error(kf_state.reshape(-1), true_xp[t])
+        pred_mse[3,t] = mean_squared_error(obs[threshold], true_xp[t])
 
     fig, ax = plt.subplots(1,1,figsize=(8,5))
     low = threshold-4; up=threshold+6; lw=2
-    for i, label in enumerate(["LSLOCK", "KF", "observation"]):
+    ax.axvline(threshold, c="k", lw=lw, ls=":")
+    for i, label in enumerate(["LSLOCK", "LLOCK", "KF", "observation"]):
         ax.plot(range(low,up), pred_mse[i,low:up], lw=lw, ls="--", c=color_list[i])
         ax.plot(range(low,threshold+1), mse_record[0,i,low:threshold+1], label=label, lw=lw, c=color_list[i])
     ax.set_xlabel("Timestep", fontsize=12)
     ax.set_ylabel("MSE", fontsize=12)
+    ax.set_yscale("log")
     ax.legend(bbox_to_anchor=(1.05, 1.0), loc="upper left", fontsize=15)
     fig.savefig(os.path.join(save_root, "prediction.png"), bbox_inches="tight")
 
