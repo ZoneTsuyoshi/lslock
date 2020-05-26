@@ -152,19 +152,26 @@ class LSLOCK(object) :
                 transition_matrix = None, observation_matrix = None,
                 transition_covariance = None, observation_covariance = None,
                 parameter_matrix = None, method = "gridwise",
-                update_interval = 1, eta = 0.9, cutoff = 1.0, 
-                save_dir = None,
-                advance_mode = False,
+                estimation_length = 10, estimation_interval = 1,
+                eta = 1., cutoff = 10., 
+                save_dir = None, save_vars = ["state", "transition_matrix"],
+                estimation_mode = "backward",
                 n_dim_sys = None, n_dim_obs = None, dtype = "float32",
-                use_gpu = True, num_cpu = "all"):
+                use_gpu = False, num_cpu = "all"):
         """Setup initial parameters.
         """
         self.use_gpu = use_gpu
         if use_gpu:
-            import cupy
-            self.xp = cupy
+            try:
+                import cupy
+                self.xp = cupy
+                self.use_gpu = True
+            except:
+                self.xp = np
+                self.use_gpu = False
         else:
             self.xp = np
+            self.use_gpu = False
 
         # determine dimensionality
         self.n_dim_sys = _determine_dimensionality(
@@ -172,14 +179,16 @@ class LSLOCK(object) :
              (initial_mean, array1d, -1),
              (initial_covariance, array2d, -2),
              (observation_matrix, array2d, -1)],
-            n_dim_sys
+            n_dim_sys,
+            self.use_gpu
         )
 
         self.n_dim_obs = _determine_dimensionality(
             [(observation_matrix, array2d, -2),
              (observation_covariance, array2d, -2),
              (parameter_matrix, array2d, -2)],
-            n_dim_obs
+            n_dim_obs,
+            self.use_gpu
         )
 
         # self.y = _parse_observations(observation)
@@ -237,24 +246,40 @@ class LSLOCK(object) :
             raise ValueError("Variable \"method\" only allows \"elementwise\" or \"gridwise\""
                 + ". So, your setting \"{}\" need to be changed.".format(method))
 
-        self.update_interval = int(update_interval)
+        if estimation_mode in ["forward", "middle", "backward"]:
+            self.estimation_mode = estimation_mode
+        else:
+            raise ValueError("\"estimation_mode\" must be choosen from \"forward\","
+                            + " \"middle\", or \"backward\".")
+
+        if self.estimation_mode in ["forward", "backward"]:
+            self.tau = int(estimation_length)
+            self.tau2 = int((estimation_length - 1) / 2)
+        else:
+            self.tau2 = int((estimation_length - 1) / 2)
+            self.tau = 2 * self.tau2 + 1
+
+        self.I = estimation_interval
         self.tm_count = 1
 
-        if save_dir is None:
-            self.save_change = False
-        else:
-            self.save_change = True
+        self.save_vars = []
+        if save_dir is not None:
             self.save_dir = save_dir
-            self.fillnum = len(str(int(self.y.shape[0] / self.update_interval)))
-            self.xp.save(os.path.join(self.save_dir, "transition_matrix_" + str(0).zfill(self.fillnum) + ".npy"), self.F)
-
+            if "state" in save_vars or "x" in save_vars:
+                self.save_vars.append("x")
+            if "transition_matrix" in save_vars or "F" in save_vars:
+                self.save_vars.append("F")
+                self.fillnum = len(str(int(self.y.shape[0] / self.I)))
+                self.xp.save(os.path.join(self.save_dir, "transition_matrix_" + str(0).zfill(self.fillnum) + ".npy"), self.F)
+            if "covariance" in save_vars or "V" in save_vars:
+                self.save_vars.append("V")
+            
         if num_cpu == "all":
             self.num_cpu = mp.cpu_count()
         else:
             self.num_cpu = num_cpu
         print("Set number of cpus are {}.".format(self.num_cpu))
 
-        self.advance_mode = advance_mode
         self.eta = eta
         self.cutoff = cutoff
         self.dtype = dtype
@@ -293,12 +318,17 @@ class LSLOCK(object) :
                 # initial setting
                 self.x_pred[0] = self.initial_mean
                 self.V_pred = self.initial_covariance.copy()
+                self._update_transition_matrix(self.tau)
             else:
-                if self.advance_mode and t-1<T-self.update_interval and (t-1)%self.update_interval==0:
-                    self._update_transition_matrix(t+self.update_interval-1)
+                if t >= 2 and t < T-self.tau+1 and (t-1)%self.I==0 and self.estimation_mode=="forward":
+                    self._update_transition_matrix(t+self.tau-1)
+                elif t >= self.tau+1 and (t-self.tau)%self.I==0 and self.estimation_mode=="backward":
+                    self._update_transition_matrix(t)
+                elif t >= self.tau2+2 and t < T-self.tau2 and (t-self.tau2-1)%self.I==0 and self.estimation_mode=="middle":
+                    self._update_transition_matrix(t+self.tau2)
                 start_time = time.time()
                 self._predict_update(t)
-                self.times[0] = time.time() - start_time
+                self.times[0] += time.time() - start_time
             
             if self.xp.any(self.xp.isnan(self.y[t])):
                 self.x_filt[t] = self.x_pred[t]
@@ -306,12 +336,12 @@ class LSLOCK(object) :
             else :
                 start_time = time.time()
                 self._filter_update(t)
-                self.times[1] = time.time() - start_time
-                if (not self.advance_mode) and t-1>self.update_interval and (t-1)%self.update_interval==0:
-                    self._update_transition_matrix(t)
+                self.times[1] += time.time() - start_time
 
+            if "V" in self.save_vars:
+                self.xp.save(os.path.join(self.save_dir, "covariance_{}.npy".format(str(t).zfill(len(str(T))))), self.V_filt)
 
-        if self.save_change:
+        if "x" in self.save_vars:
             self.xp.save(os.path.join(self.save_dir, "states.npy"), self.x_filt)
 
 
@@ -322,7 +352,7 @@ class LSLOCK(object) :
             t {int} : observation time
         """
         # extract parameters for time t-1
-        Q = _last_dims(self.Q, t - 1, 2)
+        Q = _last_dims(self.Q, t - 1, 2, self.use_gpu)
 
         # calculate predicted distribution for time t
         self.x_pred[t] = self.F @ self.x_filt[t-1]
@@ -340,7 +370,7 @@ class LSLOCK(object) :
                 : Kalman gain matrix for time t
         """
         # extract parameters for time t
-        R = _last_dims(self.R, t, 2)
+        R = _last_dims(self.R, t, 2, self.use_gpu)
 
         # calculate filter step
         K = self.V_pred @ (
@@ -363,9 +393,9 @@ class LSLOCK(object) :
         start_time = time.time()
 
         if self.use_gpu:
-            y = self.y[t-self.update_interval:t+1].get()
+            y = self.y[t-self.tau:t+1].get()
         else:
-            y = self.y[t-self.update_interval:t+1]
+            y = self.y[t-self.tau:t+1]
         
         if self.method=="elementwise": # elementwise
             where_is_A = np.where(self.A1)
@@ -381,13 +411,13 @@ class LSLOCK(object) :
                                                         itertools.repeat(y),
                                                         itertools.repeat(self.P),
                                                         itertools.repeat(self.Pmax),
-                                                        itertools.repeat(self.update_interval)))
+                                                        itertools.repeat(self.tau)))
             p.close()
             self.times[5] = time.time() - start_time2
             # G_local = np.zeros(len(where_is_A[0]))
             # for (k, i, j) in zip(range(len(where_is_A[0])), where_is_A[0], where_is_A[1]):
-            #     G_local[k] = _local_calculation(i, j, self.A1, self.A2, y, self.P, self.Pmax, self.update_interval)
-                # G_local[k] = _local_calculation(i, j, self.A, y, self.P, self.Pmax, self.update_interval)
+            #     G_local[k] = _local_calculation(i, j, self.A1, self.A2, y, self.P, self.Pmax, self.tau)
+                # G_local[k] = _local_calculation(i, j, self.A, y, self.P, self.Pmax, self.tau)
             # G[self.A] = G_local
             G[self.A1] = G_local
         elif self.method=="gridwise":
@@ -398,12 +428,12 @@ class LSLOCK(object) :
                                                         itertools.repeat(y),
                                                         itertools.repeat(self.P),
                                                         itertools.repeat(self.Pmax),
-                                                        itertools.repeat(self.update_interval)))
+                                                        itertools.repeat(self.tau)))
             p.close()
             G[self.A1] = list(itertools.chain.from_iterable(G_local))
 
             # for i in range(self.n_dim_obs):
-            #     G[i][self.A1[i]] = _gridwise_local_calculation(i, self.A1, self.A2, y, self.P, self.Pmax, self.update_interval)
+            #     G[i][self.A1[i]] = _gridwise_local_calculation(i, self.A1, self.A2, y, self.P, self.Pmax, self.tau)
 
         self.times[2] += time.time() - start_time
         if self.tm_count==1:
@@ -414,7 +444,7 @@ class LSLOCK(object) :
         self.times[3] += time.time() - start_time
         self.times[4] += 1
 
-        if self.save_change:
+        if "F" in self.save_vars:
             self.xp.save(os.path.join(self.save_dir, "transition_matrix_" + str(self.tm_count).zfill(self.fillnum) + ".npy"), self.F)
         self.tm_count += 1
 
@@ -467,3 +497,90 @@ class LSLOCK(object) :
         else:
             raise ValueError('The dim must be less than '
                  + self.x_filt.shape[1] + '.')
+
+
+
+    def fixed_lag_smooth(self, L=5):
+        T = self.y.shape[0]
+        self.x_pred = self.xp.zeros((T, self.n_dim_sys), dtype = self.dtype)
+        self.x_filt = self.xp.zeros((T, self.n_dim_sys), dtype = self.dtype)
+        self.V_pred = self.xp.zeros((T, self.n_dim_sys, self.n_dim_sys),
+             dtype = self.dtype)
+        self.V_filt = self.xp.zeros((T, self.n_dim_sys, self.n_dim_sys),
+             dtype = self.dtype)
+
+        # calculate prediction and filter for every time
+        for t in range(T):
+            # visualize calculating time
+            print("\r filter calculating... t={}".format(t) + "/" + str(T), end="")
+
+            if t == 0:
+                # initial setting
+                self.x_pred[0] = self.initial_mean
+                self.V_pred[0] = self.initial_covariance.copy()
+                self._update_transition_matrix(self.tau)
+            else:
+                if t >= 2 and t < T-self.tau+1 and (t-1)%self.I==0 and self.estimation_mode=="forward":
+                    self._update_transition_matrix(t+self.tau-1)
+                elif t >= self.tau+1 and (t-self.tau)%self.I==0 and self.estimation_mode=="backward":
+                    self._update_transition_matrix(t)
+                elif t >= self.tau2+2 and t < T-self.tau2 and (t-self.tau2-1)%self.I==0 and self.estimation_mode=="middle":
+                    self._update_transition_matrix(t+self.tau2)
+                start_time = time.time()
+                self._predict_update_lag(t, L)
+                self.times[0] += time.time() - start_time
+            
+            if self.xp.any(self.xp.isnan(self.y[t])):
+                self.x_filt[t] = self.x_pred[t]
+                self.V_filt[t] = self.V_pred[t]
+            else :
+                start_time = time.time()
+                self._filter_update_lag(t, L)
+                self.times[1] += time.time() - start_time
+
+        if "x" in self.save_vars:
+            self.xp.save(os.path.join(self.save_dir, "states.npy"), self.x_filt)
+        if "V" in self.save_vars:
+            self.xp.save(os.path.join(self.save_dir, "covariance.npy"), self.V_filt)
+
+
+
+
+    def _predict_update_lag(self, t, L):
+        """Calculate fileter update without noise
+
+        Args:
+            t {int} : observation time
+        """
+        # extract parameters for time t-1
+        Q = _last_dims(self.Q, t - 1, 2, self.use_gpu)
+
+        # calculate predicted distribution for time t
+        low = max(0, t-L)
+        self.x_pred[t] = self.F @ self.x_filt[t-1]
+        self.V_pred[t] = self.F @ self.V_filt[t-1] @ self.F.T + Q
+        self.V_pred[low:t] = self.V_filt[low:t] @ self.F.T
+
+
+    def _filter_update_lag(self, t, L):
+        """Calculate fileter update without noise
+
+        Args:
+            t {int} : observation time
+        """
+        # extract parameters for time t-1
+        R = _last_dims(self.R, t, 2, self.use_gpu)
+
+        # calculate filter step
+        low = max(0, t-L)
+        self.x_filt[t] = self.x_pred[t].copy()
+        K = self.V_pred[low:t+1] @ (
+            self.H.T @ self.xp.linalg.pinv(self.H @ (self.V_pred[t] @ self.H.T) + R)
+            ) # lag x Nx x Ny
+        self.x_filt[low:t+1] = self.x_filt[low:t+1] + K @ (
+            self.y[t] - (self.H @ self.x_pred[t])
+            )
+        # lag x Nx x Nx
+        self.V_filt[low:t+1] = self.V_pred[low:t+1] - K @ (self.H @ self.V_pred[t])
+
+

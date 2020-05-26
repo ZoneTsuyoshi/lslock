@@ -81,9 +81,10 @@ def main():
     advance = True
     sigma_initial = 0 # standard deviation of normal distribution for random making
     update_interval = 10 # update interval for LSLOCK
+    estimation_mode = "forward"
     llock_update_interval = 30 # update interval for LLOCK
-    eta = 0.99 # learning rate
-    cutoff = 1.0 # cutoff distance for update of transition matrix
+    eta = 1.0 # learning rate
+    cutoff = 10 # cutoff distance for update of transition matrix
     sigma = 0.2  # standard deviation of gaussian noise
     Q = sigma**2 * xp.eye(Nf*Nf)
     R = sigma**2 * xp.eye(Nf*Nf) # Nf x nlines
@@ -123,11 +124,12 @@ def main():
                      initial_mean = obs[0], 
                      adjacency_matrix = A,
                      dtype = dtype,
-                     update_interval = llock_update_interval,
+                     estimation_interval = llock_update_interval,
+                     estimation_length = llock_update_interval,
+                     estimation_mode = estimation_mode,
                      eta = eta, 
                      cutoff = cutoff,
                      save_dir = llock_save_dir,
-                     advance_mode = advance,
                      use_gpu = False)
     start_time = time.time()
     llock.forward()
@@ -150,11 +152,12 @@ def main():
                  initial_mean = obs[0], 
                  parameter_matrix = A,
                  dtype = dtype,
-                 update_interval = update_interval,
+                 estimation_length = update_interval,
+                 estimation_interval = update_interval,
+                 estimation_mode = estimation_mode,
                  eta = eta, 
                  cutoff = cutoff,
                  save_dir = lslock_save_dir,
-                 advance_mode = advance,
                  method = "gridwise",
                  use_gpu = False)
     start_time = time.time()
@@ -203,16 +206,16 @@ def main():
 
     fig, ax = plt.subplots(1,1,figsize=(8,5))
     for i, label in enumerate(["LSLOCK", "LLOCK", "KF", "observation"]):
-        ax.plot(mse_record[1,i], label=label, lw=2)
+        ax.plot(np.sqrt(mse_record[1,i]), label=label, lw=2)
     ax.set_xlabel("Timestep", fontsize=12)
-    ax.set_ylabel("MSE", fontsize=12)
+    ax.set_ylabel("RMSE", fontsize=12)
     ax.legend(fontsize=15)
     ax.set_yscale("log")
-    fig.savefig(os.path.join(save_root, "mse.png"), bbox_to_inches="tight")
+    fig.savefig(os.path.join(save_root, "rmse.png"), bbox_to_inches="tight")
 
 
     ## short-term prediction
-    color_list = ["r", "g", "b", "m"]
+    color_list = ["r", "g", "b", "m", "y"]
     threshold = 200
     pred_state = xp.zeros((Tf, Nf*Nf))
     llock_pred_state = xp.zeros((Tf, Nf*Nf))
@@ -239,14 +242,17 @@ def main():
         pred_mse[2,t] = mean_squared_error(kf_state.reshape(-1), true_xp[t])
         pred_mse[3,t] = mean_squared_error(obs[threshold], true_xp[t])
 
+    convlstm_mse = np.load(os.path.join(save_root, "convlstm", "convlstm_mse.npy")) # epoch//save_epoch x 10
     fig, ax = plt.subplots(1,1,figsize=(8,5))
     low = threshold-4; up=threshold+6; lw=2
     ax.axvline(threshold, c="k", lw=lw, ls=":")
     for i, label in enumerate(["LSLOCK", "LLOCK", "KF", "observation"]):
-        ax.plot(range(low,up), pred_mse[i,low:up], lw=lw, ls="--", c=color_list[i])
-        ax.plot(range(low,threshold+1), mse_record[0,i,low:threshold+1], label=label, lw=lw, c=color_list[i])
+        ax.plot(range(low,up), np.sqrt(pred_mse[i,low:up]), lw=lw, ls="--", c=color_list[i])
+        ax.plot(range(low,threshold+1), np.sqrt(mse_record[0,i,low:threshold+1]), label=label, lw=lw, c=color_list[i])
+    ax.plot(range(threshold, up), np.sqrt(convlstm_mse[400//50,:len(range(up - threshold))]), 
+        label="ConvLSTM", lw=lw, c=color_list[4])
     ax.set_xlabel("Timestep", fontsize=12)
-    ax.set_ylabel("MSE", fontsize=12)
+    ax.set_ylabel("RMSE", fontsize=12)
     ax.set_yscale("log")
     ax.legend(bbox_to_anchor=(1.05, 1.0), loc="upper left", fontsize=15)
     fig.savefig(os.path.join(save_root, "prediction.png"), bbox_inches="tight")
