@@ -1,4 +1,4 @@
-# Locally and Spatially Uniform Linear Operator Construction with Kalman Filter
+# Locally and Spatially Uniform Linear Operator Construction with the Kalman Filter
 - This repository w.r.t. locally and spatially uniform linear operator construction with the Kalman filter (LSLOCK), which enable us to estimate states and state transition of linear Gaussian state space model in real-time.
 - This repository includes the method in `src` directory, examples of application in `examples` directory.
 - For ConvLSTM, we started [this implementation](https://github.com/spacejake/convLSTM.pytorch) and changed structure in order to compare w/ the prposed method.
