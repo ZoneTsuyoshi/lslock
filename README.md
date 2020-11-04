@@ -5,7 +5,7 @@
 
 # Examples
 - We provide two examples of this method at `example` directory.
-    1. global flow data: objects flows each direcation in each interval
+    1. global flow data: objects flow each direction in each interval
         - the generation process is condeucted by `python data_global_flow.py`
         - application of the proposed method is conducted by `python global_flow.py`
         - application of ConvLSTM is conducted by `python run_convlstm.py`
